@@ -146,6 +146,7 @@ export function pullJson(forge: Forge, repo: Repo, pull: PullRec): Record<string
     base: { label: `${owner}:${pull.baseRef}`, ref: pull.baseRef, sha: baseSha ?? ZERO_SHA },
     merged: pull.merged,
     merged_at: pull.merged ? forge.isoOf(pull.seq) : null,
+    merge_commit_sha: pull.mergedSha ?? null,
     mergeable,
     mergeable_state: pull.merged ? 'clean' : mergeable ? 'clean' : 'dirty',
     draft: false,
@@ -361,7 +362,7 @@ function handleRest(ctx: Ctx, res: ServerResponse, segments: string[]): void {
       files.set(path, blobSha);
       const commitSha = repo.commitOn(branch, files, message, forge.timeOf(forge.tick()));
       return sendJson(res, existing === undefined ? 201 : 200, {
-        content: { name: path.split('/').pop(), path, sha: blobSha, size: data.length, type: 'file' },
+        content: { name: path.split('/').pop(), path, sha: blobSha, size: data.length, type: 'file', encoding: 'base64' },
         commit: { sha: commitSha, message },
       });
     }

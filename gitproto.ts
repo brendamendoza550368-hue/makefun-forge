@@ -181,6 +181,7 @@ function receiveAdvertisement(repo: Repo): Buffer {
 interface FetchArgs {
   wants: string[];
   haves: string[];
+  clientShallow: string[];
   deepen?: number;
   deepenSince?: number;
   done: boolean;
@@ -196,15 +197,37 @@ function commitTime(repo: Repo, sha: string): number {
 
 /**
  * The object set for a fetch: commits selected from the wants (bounded by
- * depth / deepen-since), their trees and blobs, minus everything reachable
- * from the haves. Returns the pack bytes and the shallow boundary.
+ * depth / deepen-since), their trees and blobs, plus any tag objects the
+ * wants name, minus everything the client already has. A have the client
+ * marks shallow excludes only itself and its trees, never its ancestors.
+ * Returns the pack, the new shallow boundary and the commits that stopped
+ * being shallow.
  */
-function computeFetch(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: string[]; objectCount: number } {
+function computeFetch(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: string[]; unshallow: string[]; objectCount: number } {
+  // Peel tag wants down to commits, keeping the tag objects for the pack.
+  const tagObjects = new Set<string>();
+  const commitWants: string[] = [];
+  for (const want of args.wants) {
+    let sha = want;
+    let guard = 0;
+    while (guard < 10) {
+      const obj = repo.store.get(sha);
+      if (!obj || obj.type !== 'tag') break;
+      tagObjects.add(sha);
+      const m = /^object ([0-9a-f]{40})/m.exec(obj.body.toString('utf8'));
+      if (!m) break;
+      sha = m[1];
+      guard += 1;
+    }
+    if (repo.store.has(sha) && repo.store.get(sha)?.type === 'commit') commitWants.push(sha);
+    else if (repo.store.has(want)) tagObjects.add(want);
+  }
+
   // Select commits.
   const selected = new Set<string>();
   const shallow = new Set<string>();
   if (args.deepen !== undefined) {
-    let frontier = args.wants.filter((w) => repo.store.has(w));
+    let frontier = commitWants;
     for (let level = 0; level < args.deepen; level += 1) {
       const next: string[] = [];
       for (const sha of frontier) {
@@ -223,7 +246,7 @@ function computeFetch(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: str
     }
   } else if (args.deepenSince !== undefined) {
     const since = args.deepenSince;
-    const queue = [...args.wants];
+    const queue = [...commitWants];
     while (queue.length > 0) {
       const sha = queue.pop() as string;
       if (selected.has(sha) || !repo.store.has(sha)) continue;
@@ -235,20 +258,40 @@ function computeFetch(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: str
       else if (parents.length > 0) shallow.add(sha);
     }
   } else {
-    for (const want of args.wants) {
+    for (const want of commitWants) {
       for (const sha of walkCommits(repo.store, want)) selected.add(sha);
     }
   }
 
+  // What the client already has. Shallow haves stop at their boundary.
+  const clientShallow = new Set(args.clientShallow);
   const excluded = new Set<string>();
+  const excludeFrom = (tip: string): void => {
+    const queue = [tip];
+    while (queue.length > 0) {
+      const sha = queue.pop() as string;
+      if (excluded.has(sha) || !repo.store.has(sha)) continue;
+      const obj = repo.store.get(sha);
+      if (!obj || obj.type !== 'commit') {
+        excluded.add(sha);
+        continue;
+      }
+      excluded.add(sha);
+      closureOfTree(repo.store, parseCommit(obj.body).tree, excluded);
+      if (clientShallow.has(sha)) continue; // the client holds nothing below its boundary
+      queue.push(...parseCommit(obj.body).parents);
+    }
+  };
   for (const have of args.haves) {
-    if (!repo.store.has(have)) continue;
-    closureOfCommit(repo.store, have, excluded);
+    if (repo.store.has(have)) excludeFrom(have);
   }
 
   const objects = new Set<string>();
+  for (const sha of tagObjects) {
+    if (!excluded.has(sha)) objects.add(sha);
+  }
   for (const sha of selected) {
-    if (excluded.has(sha)) continue;
+    if (excluded.has(sha)) continue; // the client already holds this commit
     // Only the selected commits themselves plus their own trees and blobs:
     // following parents here would undo the depth bound.
     objects.add(sha);
@@ -260,8 +303,10 @@ function computeFetch(repo: Repo, args: FetchArgs): { pack: Buffer; shallow: str
   }
   // Shallow boundaries name selected commits whose parents were cut.
   const boundary = [...shallow].filter((s) => selected.has(s));
+  const boundarySet = new Set(boundary);
+  const unshallow = args.clientShallow.filter((s) => selected.has(s) && !boundarySet.has(s));
   const pack = writePack(repo.store, [...objects]);
-  return { pack, shallow: boundary, objectCount: objects.size };
+  return { pack, shallow: boundary, unshallow, objectCount: objects.size };
 }
 
 function sidebandPackets(data: Buffer, progress?: string): Buffer[] {
@@ -308,10 +353,11 @@ function handleLsRefs(repo: Repo, argLines: string[]): Buffer {
 }
 
 function parseFetchArgs(lines: string[]): FetchArgs {
-  const args: FetchArgs = { wants: [], haves: [], done: false, noProgress: false };
+  const args: FetchArgs = { wants: [], haves: [], clientShallow: [], done: false, noProgress: false };
   for (const line of lines) {
     if (line.startsWith('want ')) args.wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) args.clientShallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) args.deepen = Number(line.slice(7));
     else if (line.startsWith('deepen-since ')) args.deepenSince = Number(line.slice(13));
     else if (line === 'done') args.done = true;
@@ -335,10 +381,11 @@ function handleFetchV2(repo: Repo, argLines: string[]): Buffer {
   // With 'done' the answer is the pack at once (shallow-info first when the
   // fetch is depth-bounded), exactly as git's upload-pack answers.
 
-  const { pack, shallow, objectCount } = computeFetch(repo, args);
-  if (args.deepen !== undefined || args.deepenSince !== undefined) {
+  const { pack, shallow, unshallow, objectCount } = computeFetch(repo, args);
+  if (args.deepen !== undefined || args.deepenSince !== undefined || args.clientShallow.length > 0) {
     parts.push(pkt('shallow-info\n'));
     for (const sha of shallow) parts.push(pkt(`shallow ${sha}\n`));
+    for (const sha of unshallow) parts.push(pkt(`unshallow ${sha}\n`));
     parts.push(FLUSH);
   }
   parts.push(pkt('packfile\n'));
@@ -351,13 +398,14 @@ function handleFetchV0(repo: Repo, lines: string[]): Buffer {
   // First want line may carry capabilities after a NUL.
   const cleaned = lines.map((line, i) => (i === 0 ? line.split('\0')[0] : line));
   const args = parseFetchArgs(cleaned);
-  const { pack, shallow } = computeFetch(repo, args);
+  const { pack, shallow, unshallow } = computeFetch(repo, args);
   const parts: Buffer[] = [];
   if (!args.done) {
     parts.push(pkt('NAK\n'));
     return Buffer.concat(parts);
   }
   for (const sha of shallow) parts.push(pkt(`shallow ${sha}\n`));
+  for (const sha of unshallow) parts.push(pkt(`unshallow ${sha}\n`));
   parts.push(pkt('NAK\n'));
   parts.push(...sidebandPackets(pack, args.noProgress ? undefined : ''));
   parts.push(FLUSH);
